@@ -6,6 +6,18 @@
 // rendered in a single walk with plain text batched, and the pure text functions (slug, long date, escape of the
 // values templates repeat) are memoised.
 
+// ---------------------------------------------------------------- phase probes (temporary)
+const PH = process.env.PHASE ? new Map() : null;
+const phAdd = (k, d) => { if (PH) PH.set(k, (PH.get(k) || 0n) + d); };
+const phNow = () => (PH ? process.hrtime.bigint() : 0n);
+const phEnd = (k, t) => { if (PH) phAdd(k, process.hrtime.bigint() - t); };
+const phDump = () => {
+  if (!PH) return;
+  const rows = [...PH.entries()].sort((a, b) => (b[1] > a[1] ? 1 : -1));
+  for (const [k, v] of rows) console.error(`  ${(Number(v) / 1000).toFixed(1).padStart(9)} ms  ${k}`);
+  PH.clear();
+};
+
 const AMP = '&amp;';
 const LT = '&lt;';
 const GT = '&gt;';
@@ -279,8 +291,9 @@ function parseFrontMatter(text) {
 const ESCAPABLE = new Uint8Array(128);
 for (const ch of '\\`*_[]()#+-.!>') ESCAPABLE[ch.charCodeAt(0)] = 1;
 
-/** Any character that can start an inline construct. */
+/** Any character that can start an inline construct, and the scanner that finds the next one. */
 const INLINE_SPECIAL = /[\\`*[]/;
+const INLINE_SCAN = /[\\`*[]/g;
 const HAS_SPACE = /\s/;
 const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
@@ -367,25 +380,33 @@ function findSingleStar(s, from) {
   return -1;
 }
 
-/** `s` rendered inline; `env.link(target)` is a link's href. Plain runs are escaped whole, never a char at a time. */
+/**
+ * `s` rendered inline; `env.link(target)` is a link's href. The scanner walks the string with a native search for the
+ * next character that can start a construct, so a plain run costs no per-character work; runs are escaped whole.
+ */
 function inline(s, env) {
   const n = s.length;
   if (n === 0) return '';
-  if (!INLINE_SPECIAL.test(s)) return escapeHtml(s);
+  INLINE_SCAN.lastIndex = 0;
+  if (INLINE_SCAN.exec(s) === null) return escapeHtml(s);
   let out = '';
-  let i = 0;
   let last = 0;
-  while (i < n) {
+  let scan = 0;
+  for (;;) {
+    INLINE_SCAN.lastIndex = scan;
+    const m = INLINE_SCAN.exec(s);
+    if (m === null) break;
+    const i = m.index;
+    scan = i + 1;
     const c = s.charCodeAt(i);
     if (c === 92) {
-      if (i + 1 < n && ESCAPABLE[s.charCodeAt(i + 1)] === 1) {
+      const nx = i + 1 < n ? s.charCodeAt(i + 1) : 0;
+      if (nx !== 0 && nx < 128 && ESCAPABLE[nx] === 1) {
         if (i > last) out += escapeHtml(s.slice(last, i));
-        out += escapeChar(s.charCodeAt(i + 1));
-        i += 2;
-        last = i;
-        continue;
+        out += escapeChar(nx);
+        last = i + 2;
+        scan = last;
       }
-      i++;
       continue;
     }
     if (c === 96) {
@@ -393,53 +414,41 @@ function inline(s, env) {
       if (j > i + 1) {
         if (i > last) out += escapeHtml(s.slice(last, i));
         out += '<code>' + escapeHtml(s.slice(i + 1, j)) + '</code>';
-        i = j + 1;
-        last = i;
-        continue;
+        last = j + 1;
+        scan = last;
       }
-      i++;
       continue;
     }
     if (c === 42) {
-      if (s.charCodeAt(i + 1) === 42) {
+      if (i + 1 < n && s.charCodeAt(i + 1) === 42) {
         const j = findStrongClose(s, i + 2);
         if (j > i + 2) {
           if (i > last) out += escapeHtml(s.slice(last, i));
           out += '<strong>' + inline(s.slice(i + 2, j), env) + '</strong>';
-          i = j + 2;
-          last = i;
-          continue;
-        }
-        i += 2;
+          last = j + 2;
+          scan = last;
+        } else scan = i + 2;
         continue;
       }
       const j = findSingleStar(s, i + 1);
       if (j > i + 1) {
         if (i > last) out += escapeHtml(s.slice(last, i));
         out += '<em>' + inline(s.slice(i + 1, j), env) + '</em>';
-        i = j + 1;
-        last = i;
-        continue;
+        last = j + 1;
+        scan = last;
       }
-      i++;
       continue;
     }
-    if (c === 91) {
-      const k = findCloseBracket(s, i + 1);
-      let m = -1;
-      if (k !== -1 && s.charCodeAt(k + 1) === 40) m = s.indexOf(')', k + 2);
-      const target = m === -1 ? '' : s.slice(k + 2, m);
-      if (target !== '' && !HAS_SPACE.test(target)) {
-        if (i > last) out += escapeHtml(s.slice(last, i));
-        out += '<a href="' + escapeHtml(env.link(target)) + '">' + inline(s.slice(i + 1, k), env) + '</a>';
-        i = m + 1;
-        last = i;
-        continue;
-      }
-      i++;
-      continue;
+    const k = findCloseBracket(s, i + 1);
+    let m2 = -1;
+    if (k !== -1 && s.charCodeAt(k + 1) === 40) m2 = s.indexOf(')', k + 2);
+    const target = m2 === -1 ? '' : s.slice(k + 2, m2);
+    if (target !== '' && !HAS_SPACE.test(target)) {
+      if (i > last) out += escapeHtml(s.slice(last, i));
+      out += '<a href="' + escapeHtml(env.link(target)) + '">' + inline(s.slice(i + 1, k), env) + '</a>';
+      last = m2 + 1;
+      scan = last;
     }
-    i++;
   }
   if (last < n) out += escapeHtml(s.slice(last, n));
   return out;
@@ -573,7 +582,14 @@ function trimLine(line) {
   return line.slice(s, e);
 }
 
-/** Whether `line` ends a paragraph: a blank line, a fence, a heading or a break. */
+/** A list item's marker, for the lines after the first. */
+const BULLET_RE = /^[-*] (.*)$/;
+const ORDERED_RE = /^(\d{1,9})\. (.*)$/;
+
+/** A line that ends a paragraph: a blank line, a fence, a heading or a break. */
+const PARA_END = /^(?:```|#{1,6}[ \t]|(?:---|\*\*\*)[ \t]*$|[ \t]*$)/gm;
+
+/** Whether `line` ends a paragraph. */
 function endsParagraph(line) {
   const c = line.charCodeAt(0);
   if (c === 96) return fenceLang(line) !== null;
@@ -582,45 +598,80 @@ function endsParagraph(line) {
   return isBlank(line);
 }
 
-/** The trimmed line when it continues a paragraph, or null when the line ends one. */
-function paraLine(line) {
-  const c0 = line.charCodeAt(0);
-  if (c0 === 96) {
-    if (fenceLang(line) !== null) return null;
-  } else if (c0 === 35) {
-    if (headingOf(line) !== null) return null;
-  } else if (c0 === 45 || c0 === 42) {
-    if (isHr(line)) return null;
+/** The start of the next line from `from` that ends a paragraph, or -1 when none does. */
+function paraEnd(src, from) {
+  const n = src.length;
+  PARA_END.lastIndex = from;
+  for (;;) {
+    const m = PARA_END.exec(src);
+    if (m === null) return -1;
+    const at = m.index;
+    const nl = src.indexOf('\n', at);
+    const line = src.slice(at, nl < 0 ? n : nl);
+    if (endsParagraph(line)) return at;
+    if (nl < 0) return -1;
+    PARA_END.lastIndex = nl + 1;
   }
-  const t = trimLine(line);
-  return t === '' ? null : t;
 }
 
+/** A paragraph's text: its lines trimmed at either end and joined by "\n". */
+function paraText(chunk) {
+  if (!PARA_PAD.test(chunk)) return chunk;
+  const parts = chunk.split('\n');
+  for (let k = 0; k < parts.length; k++) parts[k] = trimLine(parts[k]);
+  return parts.join('\n');
+}
+
+/** A paragraph line with a space or tab at either end (the anchors are per line). */
+const PARA_PAD = /^[ \t]|[ \t]$/m;
+
 /**
- * `src` rendered: its HTML, its table of contents and its excerpt. Lexing and rendering are one walk (the
- * reference lexes to tokens and then renders them; the blocks and their order are identical).
+ * `src` rendered: its HTML, its table of contents and its excerpt. Lexing and rendering are one walk over the text
+ * (the reference lexes to tokens and then renders them; the blocks and their order are identical). A paragraph is
+ * taken as one slice of the source, found with a native scan for the next line that can end it, so its lines are
+ * never looked at one by one.
  */
 function renderMarkdown(src, env) {
-  const lines = src.split('\n');
-  const count = lines.length;
+  const n = src.length;
   const ids = new Set();
   const toc = [];
   const out = [];
   let excerpt = null;
-  let i = 0;
-  while (i < count) {
-    const line = lines[i];
-    const c0 = line.charCodeAt(0);
+  let pos = 0;
+  const lineAt = (p) => {
+    const q = src.indexOf('\n', p);
+    return q < 0 ? src.slice(p) : src.slice(p, q);
+  };
+  const after = (p) => {
+    const q = src.indexOf('\n', p);
+    return q < 0 ? n : q + 1;
+  };
+  while (pos < n) {
+    const next = after(pos);
+    const line = lineAt(pos);
+    const c0 = src.charCodeAt(pos);
+    if (isBlank(line)) {
+      pos = next;
+      continue;
+    }
     if (c0 === 96) {
       const lang = fenceLang(line);
       if (lang !== null) {
-        i++;
-        out.push(`<pre><code${lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`}>`);
-        while (i < count && !isFenceClose(lines[i])) {
-          out.push(escapeHtml(lines[i]), '\n');
-          i++;
+        out.push(lang === '' ? '<pre><code>' : '<pre><code class="language-' + escapeHtml(lang) + '">');
+        pos = next;
+        let closed = false;
+        while (pos < n) {
+          const nl2 = src.indexOf('\n', pos);
+          const l2 = nl2 < 0 ? src.slice(pos) : src.slice(pos, nl2);
+          pos = nl2 < 0 ? n : nl2 + 1;
+          if (isFenceClose(l2)) {
+            closed = true;
+            break;
+          }
+          out.push(escapeHtml(l2), '\n');
         }
-        i++;
+        // a source that ends on a line end ends on one more, empty, line
+        if (!closed && n > 0 && src.charCodeAt(n - 1) === 10) out.push('\n');
         out.push('</code></pre>\n');
         continue;
       }
@@ -629,86 +680,90 @@ function renderMarkdown(src, env) {
       if (heading !== null) {
         const id = uniqueSlug(slugify(heading.text), ids);
         const html = inline(heading.text, env);
-        out.push(`<h${heading.depth} id="${id}">`, html, `</h${heading.depth}>\n`);
+        out.push('<h' + heading.depth + ' id="' + id + '">', html, '</h' + heading.depth + '>\n');
         if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
-        i++;
+        pos = next;
         continue;
       }
     } else if (c0 === 45 || c0 === 42) {
       if (isHr(line)) {
         out.push('<hr>\n');
-        i++;
+        pos = next;
+        continue;
+      }
+      const first = bulletOf(line);
+      if (first !== null) {
+        out.push('<ul>\n');
+        let cur = trimLine(first);
+        pos = next;
+        while (pos < n) {
+          const l2 = lineAt(pos);
+          const m = BULLET_RE.exec(l2);
+          if (m !== null) {
+            out.push('<li>', inline(cur, env), '</li>\n');
+            cur = trimLine(m[1]);
+            pos = after(pos);
+          } else if (isContinued(l2)) {
+            cur = cur + '\n' + trimLine(l2);
+            pos = after(pos);
+          } else break;
+        }
+        out.push('<li>', inline(cur, env), '</li>\n</ul>\n');
         continue;
       }
     } else if (c0 === 62) {
       let body = '';
-      while (i < count && lines[i].charCodeAt(0) === 62) {
-        let t = lines[i];
-        t = t.charCodeAt(1) === 32 ? t.slice(2) : t.slice(1);
-        t = trimLine(t);
+      let cur = line;
+      let at = pos;
+      for (;;) {
+        const t = trimLine(cur.charCodeAt(1) === 32 ? cur.slice(2) : cur.slice(1));
         if (t !== '') body = body === '' ? t : body + '\n' + t;
-        i++;
+        const nl2 = src.indexOf('\n', at);
+        if (nl2 < 0) {
+          at = n;
+          break;
+        }
+        at = nl2 + 1;
+        if (at >= n) break;
+        cur = lineAt(at);
+        if (cur.charCodeAt(0) !== 62) break;
       }
+      pos = at;
       out.push(body === '' ? '<blockquote>\n</blockquote>\n' : '<blockquote>\n<p>' + inline(body, env) + '</p>\n</blockquote>\n');
       continue;
     } else if (c0 >= 48 && c0 <= 57) {
-      const first = orderedOf(line);
-      if (first !== null) {
-        const start = Number(first.number);
-        out.push(start !== 1 ? `<ol start="${start}">` : '<ol>', '\n');
-        let cur = trimLine(first.text);
-        i++;
-        while (i < count) {
-          const l = lines[i];
-          const m = orderedOf(l);
+      const od = orderedOf(line);
+      if (od !== null) {
+        const start = Number(od.number);
+        out.push(start !== 1 ? '<ol start="' + start + '">' : '<ol>', '\n');
+        let cur = trimLine(od.text);
+        pos = next;
+        while (pos < n) {
+          const l2 = lineAt(pos);
+          const m = ORDERED_RE.exec(l2);
           if (m !== null) {
             out.push('<li>', inline(cur, env), '</li>\n');
-            cur = trimLine(m.text);
-            i++;
-          } else if (isContinued(l)) {
-            cur = cur + '\n' + trimLine(l);
-            i++;
+            cur = trimLine(m[2]);
+            pos = after(pos);
+          } else if (isContinued(l2)) {
+            cur = cur + '\n' + trimLine(l2);
+            pos = after(pos);
           } else break;
         }
         out.push('<li>', inline(cur, env), '</li>\n</ol>\n');
         continue;
       }
     }
-    if (c0 === 45 || c0 === 42) {
-      const text = bulletOf(line);
-      if (text !== null) {
-        out.push('<ul>\n');
-        let cur = trimLine(text);
-        i++;
-        while (i < count) {
-          const l = lines[i];
-          const m = bulletOf(l);
-          if (m !== null) {
-            out.push('<li>', inline(cur, env), '</li>\n');
-            cur = trimLine(m);
-            i++;
-          } else if (isContinued(l)) {
-            cur = cur + '\n' + trimLine(l);
-            i++;
-          } else break;
-        }
-        out.push('<li>', inline(cur, env), '</li>\n</ul>\n');
-        continue;
-      }
+    const end = paraEnd(src, next);
+    let text;
+    if (end < 0) {
+      text = paraText(src.slice(pos));
+      pos = n;
+    } else {
+      text = paraText(src.slice(pos, end - 1));
+      pos = end;
     }
-    if (isBlank(line)) {
-      i++;
-      continue;
-    }
-    let body = trimLine(line);
-    i++;
-    while (i < count) {
-      const t = paraLine(lines[i]);
-      if (t === null) break;
-      body = body + '\n' + t;
-      i++;
-    }
-    const html = inline(body, env);
+    const html = inline(text, env);
     if (excerpt === null) excerpt = html;
     out.push('<p>', html, '</p>\n');
   }
@@ -963,6 +1018,9 @@ function pageOf(s, card) {
   };
 }
 
+// ---------------------------------------------------------------- bench hooks (temporary)
+export { renderMarkdown, inline, escapeHtml, parseTemplate, renderNodes, parseFrontMatter, wordsOf };
+
 /** One site's output tree: path -> text. */
 export function run(input) {
   const baseUrl = input.site.base_url;
@@ -992,6 +1050,7 @@ export function run(input) {
     output: {},
   };
   const site = input.site;
+  let phT = phNow();
 
   // 1. sources, in code-unit order of their paths; line ends made "\n".
   const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
@@ -1001,6 +1060,7 @@ export function run(input) {
       b.sources.push({ path: f.path, text: content.indexOf('\r') === -1 ? content : content.replace(/\r\n?/g, '\n') });
     } else b.statics.push({ path: f.path, content: f.content });
   }
+  phEnd('1 sources', phT); phT = phNow();
 
   // 2. front matter.
   const kept = [];
@@ -1037,6 +1097,7 @@ export function run(input) {
     kept.push(s);
   }
   b.sources = kept;
+  phEnd('2 frontmatter', phT); phT = phNow();
 
   // 3. permalinks.
   const taken = new Map();
@@ -1055,6 +1116,7 @@ export function run(input) {
   }
 
   // 4. markdown, links resolved.
+  phEnd('3 permalinks', phT); phT = phNow();
   const staticPaths = new Set();
   for (const f of b.statics) staticPaths.add(f.path);
   for (const s of b.sources) {
@@ -1079,6 +1141,7 @@ export function run(input) {
   }
 
   // 5. collections.
+  phEnd('4 markdown', phT); phT = phNow();
   const posts = [];
   for (const s of b.sources) if (s.post) posts.push(s);
   posts.sort((x, y) => byCodeUnits(y.data.date, x.data.date) || byCodeUnits(x.slug, y.slug));
@@ -1089,6 +1152,7 @@ export function run(input) {
   }
 
   // 6. tags.
+  phEnd('5 collections', phT); phT = phNow();
   const bySlug = new Map();
   const ownTags = (s) => {
     const list = s.data.tags ?? [];
@@ -1126,6 +1190,7 @@ export function run(input) {
   b.tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
   // 7. layouts.
+  phEnd('6 tags', phT); phT = phNow();
   const cardCache = new Map();
   for (const p of b.posts) cardCache.set(p, cardOf(p));
   b.cards = cardCache;
@@ -1151,6 +1216,12 @@ export function run(input) {
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
+    if (PH) {
+      const t = process.hrtime.bigint();
+      const html = renderNodes(nodes, { vars: { site: siteVars, tags: allTags, recent, ...vars }, parent: null }, ctx, 0);
+      PH.set('r:' + name, (PH.get('r:' + name) || 0n) + (process.hrtime.bigint() - t));
+      return html;
+    }
     return renderNodes(nodes, { vars: { site: siteVars, tags: allTags, recent, ...vars }, parent: null }, ctx, 0);
   };
   for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s, cardCache.get(s)) });
@@ -1178,6 +1249,7 @@ export function run(input) {
     if (Object.hasOwn(b.output, f.path)) b.report.push(`shadowed ${f.path}: a built page has its path`);
     else b.output[f.path] = f.content;
   }
+  phEnd('7 layouts', phT); phT = phNow();
 
   // 8. the report.
   const lines = [...b.report, ...b.broken].sort(byCodeUnits);
@@ -1185,5 +1257,7 @@ export function run(input) {
   for (const s of b.sources) if (!s.post) pageCount++;
   lines.push(`built ${pageCount} pages, ${b.posts.length} posts, ${b.tags.length} tags and ${b.statics.length} static files`);
   b.output[REPORT_FILE] = `${lines.join('\n')}\n`;
+  phEnd('8 report', phT);
+  phDump();
   return b.output;
 }
