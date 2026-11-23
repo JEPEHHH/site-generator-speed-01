@@ -647,9 +647,10 @@ function renderMarkdown(src, env) {
     return q < 0 ? n : q + 1;
   };
   while (pos < n) {
-    const next = after(pos);
-    const line = lineAt(pos);
     const c0 = src.charCodeAt(pos);
+    const nl = src.indexOf('\n', pos);
+    const next = nl < 0 ? n : nl + 1;
+    const line = nl < 0 ? src.slice(pos) : src.slice(pos, nl);
     if (isBlank(line)) {
       pos = next;
       continue;
@@ -942,7 +943,18 @@ function renderNodes(nodes, scope, ctx, depth) {
       }
       case 'include': {
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) out += renderNodes(t, scope, ctx, depth + 1);
+        if (t !== undefined && depth < INCLUDE_DEPTH) {
+          // an include that reads only what is the same for every page of the site renders once, not once per page
+          if (depth === 0 && scope.parent === null && t._fixed === true) {
+            const hit = ctx.includes.get(t);
+            if (hit !== undefined) out += hit;
+            else {
+              const one = renderNodes(t, scope, ctx, depth + 1);
+              ctx.includes.set(t, one);
+              out += one;
+            }
+          } else out += renderNodes(t, scope, ctx, depth + 1);
+        }
         break;
       }
     }
@@ -1035,6 +1047,54 @@ export function run(input) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
     }
+  }
+
+  // An include that reads only what is fixed for the whole site (the site's title, its tags, its recent posts) and
+  // whose own includes do too, renders the same text on every page: it is rendered once and reused.
+  const FIXED = new Set(['site', 'tags', 'recent']);
+  const usesOf = new Map();
+  for (const [tname, nodes] of templates) {
+    const heads = new Set();
+    const inserts = new Set();
+    const walkUses = (list) => {
+      for (let i = 0; i < list.length; i++) {
+        const n = list[i];
+        if (n.path !== undefined) heads.add(n.path[0]);
+        if (n.kind === 'include') inserts.add(n.name);
+        else if (n.kind === 'if') {
+          walkUses(n.then);
+          if (n.else !== null) walkUses(n.else);
+        } else if (n.kind === 'for') walkUses(n.body);
+      }
+    };
+    walkUses(nodes);
+    usesOf.set(tname, { heads, inserts });
+  }
+  const fixedMemo = new Map();
+  const isFixed = (tname, seen) => {
+    let memo = fixedMemo.get(tname);
+    if (memo !== undefined) return memo;
+    const u = usesOf.get(tname);
+    let ok = u !== undefined;
+    if (ok) {
+      for (const h of u.heads) {
+        if (!FIXED.has(h)) { ok = false; break; }
+      }
+    }
+    if (ok) {
+      for (const inc of u.inserts) {
+        if (!templates.has(inc)) continue;
+        if (seen.has(inc)) { ok = false; break; }
+        seen.add(inc);
+        if (!isFixed(inc, seen)) { ok = false; break; }
+      }
+    }
+    fixedMemo.set(tname, ok);
+    return ok;
+  };
+  for (const tname of names) {
+    const nodes = templates.get(tname);
+    if (nodes !== undefined && nodes.length !== 0 && isFixed(tname, new Set())) nodes._fixed = true;
   }
   const b = {
     base,
