@@ -387,8 +387,6 @@ function findSingleStar(s, from) {
 function inline(s, env) {
   const n = s.length;
   if (n === 0) return '';
-  INLINE_SCAN.lastIndex = 0;
-  if (INLINE_SCAN.exec(s) === null) return escapeHtml(s);
   let out = '';
   let last = 0;
   let scan = 0;
@@ -1263,6 +1261,8 @@ export function run(input) {
   const escapeMemo = new Map();
   const ctx = {
     templates,
+    // one memo per run: a fixed include renders the same text on every page, so the first render is kept
+    includes: new Map(),
     escape: (text) => {
       if (text.length > 1024) return escapeHtml(text);
       const hit = escapeMemo.get(text);
